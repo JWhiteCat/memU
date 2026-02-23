@@ -531,6 +531,7 @@ class MemorizeMixin:
         # These prompts are instructions that request structured output, not text summaries.
         tasks = [client.chat(prompt_text) for prompt_text in valid_prompts]
         responses = await asyncio.gather(*tasks)
+        logger.debug("Memory extraction received %d responses from LLM", len(responses))
         return self._parse_structured_entries(memory_types, responses)
 
     def _parse_structured_entries(
@@ -1257,17 +1258,132 @@ class MemorizeMixin:
             normalized.append(entry)
         return normalized
 
+    def _try_parse_json_memory_response(self, raw: str) -> list[dict[str, Any]]:
+        """Fallback: try parsing LLM response as JSON when XML parsing fails.
+
+        Handles several JSON structures LLMs commonly return:
+        - {"item": {"memory": [{"content": "...", "categories": [...]}]}}
+        - {"memories_items": [{"content": "...", "categories": [...]}]}
+        - {"memory": [{"content": "...", "categories": [...]}]}
+        - [{"content": "...", "categories": [...]}]
+        - Any root key wrapping a "memory" array or a list of {content, categories}
+        """
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            # Try extracting a JSON blob from surrounding text
+            try:
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start == -1 or end == -1 or end <= start:
+                    # Also try array format
+                    start = raw.find("[")
+                    end = raw.rfind("]")
+                if start == -1 or end == -1 or end <= start:
+                    return []
+                payload = json.loads(raw[start : end + 1])
+            except Exception:
+                return []
+
+        return self._extract_memory_items_from_json(payload)
+
+    def _extract_memory_items_from_json(self, payload: Any) -> list[dict[str, Any]]:
+        """Extract memory items from various JSON structures."""
+        # Direct list of memory items: [{"content": ..., "categories": ...}, ...]
+        if isinstance(payload, list):
+            return self._normalize_memory_list(payload)
+
+        if not isinstance(payload, dict):
+            return []
+
+        # {"memories_items": [...]} — legacy format
+        if "memories_items" in payload:
+            items = payload["memories_items"]
+            if isinstance(items, list):
+                return self._normalize_memory_list(items)
+
+        # {"memory": [...]} — direct memory array
+        if "memory" in payload:
+            mem = payload["memory"]
+            if isinstance(mem, list):
+                return self._normalize_memory_list(mem)
+
+        # {"item": {"memory": [...]}} or {"items": {"memory": [...]}} etc.
+        # Try any top-level key that maps to a dict/list containing memory items
+        for key, value in payload.items():
+            if isinstance(value, dict) and "memory" in value:
+                mem = value["memory"]
+                if isinstance(mem, list):
+                    return self._normalize_memory_list(mem)
+            if isinstance(value, list):
+                # The top-level key itself might be a list of memory items
+                normalized = self._normalize_memory_list(value)
+                if normalized:
+                    return normalized
+
+        return []
+
+    @staticmethod
+    def _normalize_memory_list(items: list[Any]) -> list[dict[str, Any]]:
+        """Normalize a list of potential memory item dicts."""
+        result: list[dict[str, Any]] = []
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            content = entry.get("content")
+            categories = entry.get("categories")
+            if isinstance(content, str) and content.strip():
+                mem: dict[str, Any] = {"content": content.strip()}
+                if isinstance(categories, list):
+                    mem["categories"] = [
+                        str(c).strip() for c in categories if isinstance(c, str) and c.strip()
+                    ]
+                if mem.get("categories"):
+                    result.append(mem)
+        return result
+
     def _find_xml_boundaries(self, raw: str) -> tuple[int, int, str] | None:
         """Find the start index, end index, and closing tag for XML root element."""
-        root_tags = ["item", "profile", "behaviors", "events", "knowledge", "skills"]
+        raw_lower = raw.lower()
+        # Try known root tags first (case-insensitive)
+        root_tags = [
+            "item", "items", "profile", "behaviors", "events", "knowledge", "skills",
+            "memories", "memory_items", "response", "result", "output",
+        ]
         for tag in root_tags:
             opening = f"<{tag}>"
             closing = f"</{tag}>"
-            start_idx = raw.find(opening)
+            start_idx = raw_lower.find(opening)
             if start_idx != -1:
-                end_idx = raw.rfind(closing)
+                end_idx = raw_lower.rfind(closing)
                 if end_idx != -1:
-                    return (start_idx, end_idx, closing)
+                    # Use the actual casing from the original string for the closing tag
+                    actual_closing = raw[end_idx : end_idx + len(closing)]
+                    return (start_idx, end_idx, actual_closing)
+
+        # Also try tags with attributes (e.g. <item type="profile">)
+        for tag in root_tags:
+            attr_pattern = re.compile(rf"<{tag}\s+[^>]*>", re.IGNORECASE)
+            attr_match = attr_pattern.search(raw)
+            if attr_match:
+                closing = f"</{tag}>"
+                close_pattern = re.compile(closing, re.IGNORECASE)
+                close_match = close_pattern.search(raw, attr_match.end())
+                if close_match:
+                    return (attr_match.start(), close_match.start(), raw[close_match.start():close_match.end()])
+
+        # Fallback: find any XML tag that wraps <memory> elements
+        # Skip known non-wrapper tags
+        skip_tags = {"memory", "content", "categories", "category", "thinking", "think", "思考", "反思"}
+        for tag_match in re.finditer(r"<(\w+)(?:\s[^>]*)?>", raw):
+            tag_name = tag_match.group(1)
+            if tag_name.lower() in skip_tags:
+                continue
+            closing = f"</{tag_name}>"
+            end_idx = raw.rfind(closing)
+            if end_idx != -1 and "<memory>" in raw[tag_match.start():end_idx].lower():
+                return (tag_match.start(), end_idx, closing)
+
         return None
 
     def _parse_memory_element(self, memory_elem: Element) -> dict[str, Any] | None:
@@ -1304,11 +1420,38 @@ class MemorizeMixin:
         if not raw or not raw.strip():
             return []
         raw = raw.strip()
+        logger.debug("Memory extraction XML input (first 500 chars): %s", raw[:500])
+
+        # Strip markdown code fences if present (e.g. ```xml ... ```)
+        if raw.startswith("```"):
+            first_nl = raw.find("\n")
+            if first_nl != -1:
+                raw = raw[first_nl + 1:]
+            if raw.rstrip().endswith("```"):
+                raw = raw.rstrip()[:-3].rstrip()
 
         try:
             boundaries = self._find_xml_boundaries(raw)
             if boundaries is None:
-                logger.warning("Could not find valid root tag in XML response")
+                # Last resort: if raw contains <memory> elements but no wrapper, synthesize one
+                if "<memory>" in raw and "</memory>" in raw:
+                    memory_blocks = re.findall(r"<memory>.*?</memory>", raw, re.DOTALL)
+                    if memory_blocks:
+                        xml_content = "<item>" + "".join(memory_blocks) + "</item>"
+                        xml_content = xml_content.replace("&", "&amp;")
+                        root = ET.fromstring(xml_content)
+                        result: list[dict[str, Any]] = []
+                        for memory_elem in root.findall("memory"):
+                            parsed = self._parse_memory_element(memory_elem)
+                            if parsed:
+                                result.append(parsed)
+                        return result
+                # JSON fallback: some LLMs return JSON instead of XML
+                json_result = self._try_parse_json_memory_response(raw)
+                if json_result:
+                    logger.debug("Parsed memory response via JSON fallback (%d items)", len(json_result))
+                    return json_result
+                logger.warning("Could not find valid root tag in XML response. Response preview: %.300s", raw[:300])
                 return []
 
             start_idx, end_idx, end_tag = boundaries
